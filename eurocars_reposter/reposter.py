@@ -14,11 +14,18 @@ from telethon.sessions import StringSession
 
 SOURCE = os.getenv("SOURCE_CHANNEL", "eurocar_group")
 DESTINATION = os.getenv("DESTINATION_CHANNEL", "Euro_Cars_Official")
+DESTINATIONS = list(dict.fromkeys(
+    item.strip() for item in os.getenv("DESTINATION_CHANNELS", DESTINATION).split(",")
+    if item.strip()
+))
 CONTACT = os.getenv("CONTACT", "@Boris_GlobalAuto")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() != "false"
 DB_PATH = os.getenv("DB_PATH", "./private/reposted.sqlite3")
 REPOST_SINCE = datetime.fromisoformat(
     os.getenv("REPOST_SINCE", "2026-09-23T15:49:00+00:00")
+).astimezone(timezone.utc)
+NEW_DESTINATIONS_SINCE = datetime.fromisoformat(
+    os.getenv("NEW_DESTINATIONS_SINCE", REPOST_SINCE.isoformat())
 ).astimezone(timezone.utc)
 
 # Telegram usernames, Telegram/WhatsApp links, emails, and international/local
@@ -52,7 +59,10 @@ def rewrite(text: str) -> str:
 def db_connect():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DB_PATH)
-    connection.execute("CREATE TABLE IF NOT EXISTS delivered (source_id INTEGER PRIMARY KEY)")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS delivered_destinations "
+        "(source_id INTEGER, destination TEXT, PRIMARY KEY(source_id, destination))"
+    )
     connection.commit()
     return connection
 
@@ -72,41 +82,71 @@ async def main():
     if not await client.is_user_authorized():
         raise RuntimeError("Telegram session expired; create a new TG_SESSION locally")
     source = await client.get_entity(SOURCE)
-    destination = await client.get_entity(DESTINATION)
+    destinations = []
+    for name in DESTINATIONS:
+        try:
+            entity = await client.get_entity(name)
+            since = REPOST_SINCE if name == DESTINATION else NEW_DESTINATIONS_SINCE
+            destinations.append((name, entity, since))
+        except Exception:
+            logging.exception("Cannot access destination %s", name)
+    if not destinations:
+        raise RuntimeError("No reachable destinations")
     lock = asyncio.Lock()
 
-    async def publish(messages):
+    def delivered(ids, name):
+        return any(connection.execute(
+            "SELECT 1 FROM delivered_destinations WHERE source_id=? AND destination=?",
+            (mid, name),
+        ).fetchone() for mid in ids)
+
+    def mark_delivered(ids, name):
+        connection.executemany(
+            "INSERT OR IGNORE INTO delivered_destinations VALUES (?, ?)",
+            [(mid, name) for mid in ids],
+        )
+        connection.commit()
+
+    async def publish(messages, name, destination):
         ids = [message.id for message in messages]
         async with lock:
-            if any(connection.execute("SELECT 1 FROM delivered WHERE source_id=?", (mid,)).fetchone() for mid in ids):
+            if delivered(ids, name):
                 return
             caption = rewrite(next((m.raw_text for m in messages if m.raw_text), ""))
             media = [m.media for m in messages if m.media]
             if DRY_RUN:
-                logging.info("PREVIEW ids=%s media=%s text=%r", ids, len(media), caption)
+                logging.info("PREVIEW destination=%s ids=%s media=%s text=%r",
+                             name, ids, len(media), caption)
                 return
             if media:
-                if len(media) == 1:
-                    await client.send_file(destination, media[0], caption=caption)
-                else:
-                    await client.send_file(destination, media, caption=caption)
+                await client.send_file(destination, media[0] if len(media) == 1 else media,
+                                       caption=caption)
             elif caption:
                 await client.send_message(destination, caption)
             else:
                 return
-            connection.executemany("INSERT OR IGNORE INTO delivered VALUES (?)", [(mid,) for mid in ids])
-            connection.commit()
-            logging.info("Published source ids=%s", ids)
+            mark_delivered(ids, name)
+            logging.info("Published source ids=%s destination=%s", ids, name)
+
+    async def publish_all(messages):
+        for name, destination, since in destinations:
+            if all(m.date and m.date < since for m in messages):
+                continue
+            try:
+                await publish(messages, name, destination)
+            except Exception:
+                logging.exception("Failed publishing source ids=%s destination=%s",
+                                  [m.id for m in messages], name)
 
     @client.on(events.Album(chats=source))
     async def on_album(event):
-        await publish(event.messages)
+        await publish_all(event.messages)
 
     @client.on(events.NewMessage(chats=source))
     async def on_message(event):
         if event.message.grouped_id:
             return  # Album handler sends grouped media in one publication.
-        await publish([event.message])
+        await publish_all([event.message])
 
     async def reconcile():
         """Recover posts missed during restarts or when live updates do not arrive."""
@@ -114,43 +154,45 @@ async def main():
             try:
                 recent = await client.get_messages(source, limit=50)
                 eligible = sorted(
-                    (m for m in recent if m.date and m.date >= REPOST_SINCE),
+                    (m for m in recent if m.date and m.date >=
+                     min(since for _, _, since in destinations)),
                     key=lambda m: m.id,
                 )
                 groups = {}
                 for message in eligible:
                     groups.setdefault(message.grouped_id or message.id, []).append(message)
-                # Railway's filesystem may reset on deployment. Check destination
-                # captions so a recovered post is not sent again after a restart.
-                sent = await client.get_messages(destination, limit=100)
-                destination_texts = {m.raw_text for m in sent if m.raw_text}
-                for messages in sorted(groups.values(), key=lambda group: group[0].id):
-                    ids = [m.id for m in messages]
-                    if any(connection.execute(
-                        "SELECT 1 FROM delivered WHERE source_id=?", (mid,)
-                    ).fetchone() for mid in ids):
-                        continue
-                    caption = rewrite(next((m.raw_text for m in messages if m.raw_text), ""))
-                    if caption in destination_texts:
-                        connection.executemany(
-                            "INSERT OR IGNORE INTO delivered VALUES (?)",
-                            [(mid,) for mid in ids],
-                        )
-                        connection.commit()
-                        logging.info("Already in destination: source ids=%s", ids)
-                        continue
-                    logging.info("Recovering source ids=%s date=%s", ids, messages[0].date)
-                    await publish(messages)
-                    destination_texts.add(caption)
-                logging.info(
-                    "Checked %d recent source messages since %s",
-                    len(eligible), REPOST_SINCE.isoformat(),
-                )
+                for name, destination, since in destinations:
+                    try:
+                        sent = await client.get_messages(destination, limit=100)
+                        destination_texts = {m.raw_text for m in sent if m.raw_text}
+                        for messages in sorted(groups.values(), key=lambda group: group[0].id):
+                            if all(m.date < since for m in messages):
+                                continue
+                            ids = [m.id for m in messages]
+                            if delivered(ids, name):
+                                continue
+                            caption = rewrite(next(
+                                (m.raw_text for m in messages if m.raw_text), ""
+                            ))
+                            if caption in destination_texts:
+                                mark_delivered(ids, name)
+                                logging.info("Already in destination=%s: source ids=%s",
+                                             name, ids)
+                                continue
+                            logging.info("Recovering source ids=%s destination=%s",
+                                         ids, name)
+                            await publish(messages, name, destination)
+                            destination_texts.add(caption)
+                    except Exception:
+                        logging.exception("Failed checking destination %s", name)
+                logging.info("Checked %d recent source messages, %d destinations",
+                             len(eligible), len(destinations))
             except Exception:
                 logging.exception("Failed to reconcile source; retrying in 60 seconds")
             await asyncio.sleep(60)
 
-    logging.info("Listening to @%s -> @%s; dry_run=%s", SOURCE, DESTINATION, DRY_RUN)
+    logging.info("Listening to @%s -> %s; dry_run=%s", SOURCE,
+                 ", ".join(name for name, _, _ in destinations), DRY_RUN)
     task = asyncio.create_task(reconcile())
     try:
         await client.run_until_disconnected()
