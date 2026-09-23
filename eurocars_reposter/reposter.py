@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 from pathlib import Path
+from datetime import datetime, timezone
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -16,6 +17,9 @@ DESTINATION = os.getenv("DESTINATION_CHANNEL", "Euro_Cars_Official")
 CONTACT = os.getenv("CONTACT", "@Boris_GlobalAuto")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() != "false"
 DB_PATH = os.getenv("DB_PATH", "./private/reposted.sqlite3")
+REPOST_SINCE = datetime.fromisoformat(
+    os.getenv("REPOST_SINCE", "2026-09-23T15:49:00+00:00")
+).astimezone(timezone.utc)
 
 # Telegram usernames, Telegram/WhatsApp links, emails, and international/local
 # phone numbers are treated as contact details. Vehicle specifications remain.
@@ -104,8 +108,55 @@ async def main():
             return  # Album handler sends grouped media in one publication.
         await publish([event.message])
 
+    async def reconcile():
+        """Recover posts missed during restarts or when live updates do not arrive."""
+        while True:
+            try:
+                recent = await client.get_messages(source, limit=50)
+                eligible = sorted(
+                    (m for m in recent if m.date and m.date >= REPOST_SINCE),
+                    key=lambda m: m.id,
+                )
+                groups = {}
+                for message in eligible:
+                    groups.setdefault(message.grouped_id or message.id, []).append(message)
+                # Railway's filesystem may reset on deployment. Check destination
+                # captions so a recovered post is not sent again after a restart.
+                sent = await client.get_messages(destination, limit=100)
+                destination_texts = {m.raw_text for m in sent if m.raw_text}
+                for messages in sorted(groups.values(), key=lambda group: group[0].id):
+                    ids = [m.id for m in messages]
+                    if any(connection.execute(
+                        "SELECT 1 FROM delivered WHERE source_id=?", (mid,)
+                    ).fetchone() for mid in ids):
+                        continue
+                    caption = rewrite(next((m.raw_text for m in messages if m.raw_text), ""))
+                    if caption in destination_texts:
+                        connection.executemany(
+                            "INSERT OR IGNORE INTO delivered VALUES (?)",
+                            [(mid,) for mid in ids],
+                        )
+                        connection.commit()
+                        logging.info("Already in destination: source ids=%s", ids)
+                        continue
+                    logging.info("Recovering source ids=%s date=%s", ids, messages[0].date)
+                    await publish(messages)
+                    destination_texts.add(caption)
+                logging.info(
+                    "Checked %d recent source messages since %s",
+                    len(eligible), REPOST_SINCE.isoformat(),
+                )
+            except Exception:
+                logging.exception("Failed to reconcile source; retrying in 60 seconds")
+            await asyncio.sleep(60)
+
     logging.info("Listening to @%s -> @%s; dry_run=%s", SOURCE, DESTINATION, DRY_RUN)
-    await client.run_until_disconnected()
+    task = asyncio.create_task(reconcile())
+    try:
+        await client.run_until_disconnected()
+    finally:
+        task.cancel()
+        connection.close()
 
 
 if __name__ == "__main__":
