@@ -92,6 +92,27 @@ async def main():
             logging.exception("Cannot access destination %s", name)
     if not destinations:
         raise RuntimeError("No reachable destinations")
+    me = await client.get_me()
+    for name, entity, _ in destinations:
+        try:
+            permissions = await client.get_permissions(entity, me)
+            broadcast = bool(getattr(entity, "broadcast", False))
+            defaults = getattr(entity, "default_banned_rights", None)
+            group_restricted = bool(getattr(defaults, "send_messages", False))
+            can_post = (
+                not permissions.has_left and not permissions.is_banned
+                and (permissions.post_messages if broadcast
+                     else permissions.is_admin or not group_restricted)
+            )
+            logging.info(
+                "Posting rights destination=%s type=%s allowed=%s admin=%s",
+                name, "channel" if broadcast else "chat",
+                can_post, permissions.is_admin,
+            )
+            if not can_post:
+                logging.warning("Account cannot publish to %s with current rights", name)
+        except Exception:
+            logging.exception("Could not verify posting rights for %s", name)
     lock = asyncio.Lock()
 
     def delivered(ids, name):
