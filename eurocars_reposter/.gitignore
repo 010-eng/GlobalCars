@@ -1,0 +1,6 @@
+.env
+private/
+*.session*
+*.sqlite3
+__pycache__/
+.venv/
