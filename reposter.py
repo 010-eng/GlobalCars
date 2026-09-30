@@ -1,4 +1,4 @@
-"""Repost new Eurocar channel messages using a user Telegram session."""
+"""Repost new channel messages using a dedicated user Telegram session."""
 
 import asyncio
 import logging
@@ -12,17 +12,17 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 
-SOURCE = os.getenv("SOURCE_CHANNEL", "eurocar_group")
-DESTINATION = os.getenv("DESTINATION_CHANNEL", "Euro_Cars_Official")
+SOURCE = os.getenv("SOURCE_CHANNEL", "").strip()
+DESTINATION = os.getenv("DESTINATION_CHANNEL", "").strip()
 DESTINATIONS = list(dict.fromkeys(
     item.strip() for item in os.getenv("DESTINATION_CHANNELS", DESTINATION).split(",")
     if item.strip()
 ))
-CONTACT = os.getenv("CONTACT", "@Boris_GlobalAuto")
+CONTACT = os.getenv("CONTACT", "").strip()
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() != "false"
 DB_PATH = os.getenv("DB_PATH", "./private/reposted.sqlite3")
 REPOST_SINCE = datetime.fromisoformat(
-    os.getenv("REPOST_SINCE", "2026-09-23T15:49:00+00:00")
+    os.getenv("REPOST_SINCE", "2100-01-01T00:00:00+00:00")
 ).astimezone(timezone.utc)
 NEW_DESTINATIONS_SINCE = datetime.fromisoformat(
     os.getenv("NEW_DESTINATIONS_SINCE", REPOST_SINCE.isoformat())
@@ -68,7 +68,7 @@ def db_connect():
 
 
 async def main():
-    required = ("TG_API_ID", "TG_API_HASH", "TG_SESSION")
+    required = ("TG_API_ID", "TG_API_HASH", "TG_SESSION", "SOURCE_CHANNEL", "DESTINATION_CHANNELS", "CONTACT", "REPOST_SINCE")
     missing = [name for name in required if not os.getenv(name)]
     if missing:
         logging.warning("Waiting for Railway variables: %s. Set them and redeploy.", ", ".join(missing))
