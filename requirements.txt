@@ -1,2 +1,1 @@
-pyTelegramBotAPI
-requests
+Telethon>=1.36,<2
